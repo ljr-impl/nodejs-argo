@@ -1,4 +1,10 @@
 #!/usr/bin/env node
+// 环境变量大小写兼容垫片：某些 PaaS 会把变量名强制转小写（如 NEZHA_SERVER 变成 nezha_server），
+// 导致程序读不到。这里把缺失的大写变量用小写同名的值回填，之后代码里的 process.env 读取不受影响。
+for (const _envKey of Object.keys(process.env)) {
+  const _upperKey = _envKey.toUpperCase();
+  if (!(_upperKey in process.env)) process.env[_upperKey] = process.env[_envKey];
+}
 
 const http = require("http");
 const axios = require("axios");
