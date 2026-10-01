@@ -98,136 +98,6 @@ let configPath = path.join(FILE_PATH, 'config.json');
 let certPath = path.resolve(FILE_PATH, 'cert.pem');
 let keyPath = path.resolve(FILE_PATH, 'private.key');
 
-// ==================== [custom] 隧道看门狗 ====================
-// 背景：dcdeploy 等平台约 1 分钟就会掐掉 cloudflared 长连接，而原逻辑只启动一次、
-// 输出全进 /dev/null，掉线后无感知、无恢复。
-// 开关：环境变量 TUNNEL_WATCHDOG=true 时启用，默认关闭（不设或设其他值都关闭）。
-// 行为：每 60 秒检查一次——
-//   1) cloudflared 进程是否存活 → 死了立即重拉；
-//   2) 进程在 → 从容器内公网探测隧道域名 → 期望 502（源站是 vless 端口时的正常值），
-//      若返回 530/1033 或超时/连不上 → 隧道实际已断 → 连续 2 次失败后杀掉重拉。
-// 开启后 cloudflared 日志改写到 .npm/.cloudflared-watchdog.log（每次重拉截断），
-// 重拉时自动打印最后 20 行方便定位死因。开关关闭时，启动命令与原版逐字节一致。
-// =============================================================
-const TUNNEL_WATCHDOG = process.env.TUNNEL_WATCHDOG === 'true'; // [custom]
-const WATCHDOG_INTERVAL_MS = 60000;         // [custom] 检查间隔
-const WATCHDOG_PROBE_TIMEOUT_MS = 15000;    // [custom] 公网探测超时
-const WATCHDOG_FAIL_THRESHOLD = 2;          // [custom] 公网探测连续失败几次才重拉（进程死了则立即重拉）
-const WATCHDOG_PID_FILE = path.join(FILE_PATH, '.cloudflared.pid');        // [custom]
-const WATCHDOG_LOG_FILE = path.join(FILE_PATH, '.cloudflared-watchdog.log'); // [custom]
-
-let watchdogArgoArgs = '';   // [custom] 最近一次 cloudflared 启动参数（重拉时复用）
-let watchdogFailCount = 0;   // [custom] 公网探测连续失败计数
-let watchdogStarted = false; // [custom] 定时器是否已启动
-let watchdogBusy = false;    // [custom] 防止检查重叠
-
-function watchdogLog(msg) { // [custom]
-  console.log(`[watchdog] ${new Date().toISOString()} ${msg}`);
-}
-
-// [custom] 启动 cloudflared：开关关闭时与原版命令逐字节一致；
-// 开启时输出改写到日志文件并记录 pid，供看门狗检查/重拉使用。
-async function launchCloudflared(args) { // [custom]
-  watchdogArgoArgs = args;
-  if (TUNNEL_WATCHDOG) {
-    try { fs.writeFileSync(WATCHDOG_LOG_FILE, ''); } catch (e) { /* 忽略 */ }
-    await exec(`nohup "${path.resolve(botPath)}" ${args} >"${WATCHDOG_LOG_FILE}" 2>&1 & echo $! > "${WATCHDOG_PID_FILE}"`);
-  } else {
-    await exec(`nohup "${path.resolve(botPath)}" ${args} >/dev/null 2>&1 &`);
-  }
-}
-
-// [custom] cloudflared 进程是否存活：先读 pidfile，再用 pgrep 兜底
-async function isCloudflaredAlive() { // [custom]
-  try {
-    const pid = parseInt(fs.readFileSync(WATCHDOG_PID_FILE, 'utf-8').trim(), 10);
-    if (pid > 0) {
-      try { process.kill(pid, 0); return true; } catch (e) { /* pid 已不存在 */ }
-    }
-  } catch (e) { /* 无 pidfile */ }
-  try {
-    const { stdout } = await exec(`pgrep -f "${botName}"`);
-    return stdout.trim().length > 0;
-  } catch (e) {
-    return false;
-  }
-}
-
-// [custom] 从容器内公网探测隧道：502 = 隧道通（源站是 vless 端口时的正常值）；
-// 530/1033/超时/连不上 = 隧道断。其他状态码一律视为隧道通（源站问题不归看门狗管）。
-async function isTunnelReachable() { // [custom]
-  if (!ARGO_DOMAIN) return true; // 临时隧道无固定域名，跳过公网探测
-  try {
-    const resp = await axios.get(`https://${ARGO_DOMAIN}/`, {
-      timeout: WATCHDOG_PROBE_TIMEOUT_MS,
-      validateStatus: () => true,
-      headers: { 'User-Agent': 'Mozilla/5.0' },
-    });
-    const code = resp.status;
-    return !(code === 530 || code === 1033);
-  } catch (e) {
-    return false;
-  }
-}
-
-// [custom] 打印 cloudflared 日志尾部（定位死因），限 20 行
-function dumpCloudflaredTail() { // [custom]
-  try {
-    const content = fs.readFileSync(WATCHDOG_LOG_FILE, 'utf-8');
-    const lines = content.trim().split('\n').slice(-20);
-    watchdogLog('cloudflared 日志尾部(死因取证):');
-    lines.forEach((l) => console.log(`[watchdog]   ${l}`));
-  } catch (e) { /* 无日志 */ }
-}
-
-// [custom] 杀掉残留 cloudflared 并重拉
-async function relaunchCloudflared(reason) { // [custom]
-  watchdogLog(`重拉 cloudflared，原因：${reason}`);
-  dumpCloudflaredTail();
-  try { await exec(`pkill -f "${botName}"`); } catch (e) { /* 可能本来就没了 */ }
-  await new Promise((r) => setTimeout(r, 2000));
-  await launchCloudflared(watchdogArgoArgs);
-  watchdogLog('cloudflared 已重拉');
-  watchdogFailCount = 0;
-}
-
-// [custom] 看门狗主循环
-async function watchdogTick() { // [custom]
-  if (watchdogBusy) return;
-  watchdogBusy = true;
-  try {
-    const alive = await isCloudflaredAlive();
-    if (!alive) {
-      await relaunchCloudflared('进程不存在');
-      return;
-    }
-    const ok = await isTunnelReachable();
-    if (ok) {
-      if (watchdogFailCount > 0) watchdogLog('隧道恢复正常');
-      watchdogFailCount = 0;
-    } else {
-      watchdogFailCount += 1;
-      watchdogLog(`公网探测失败(${watchdogFailCount}/${WATCHDOG_FAIL_THRESHOLD})`);
-      if (watchdogFailCount >= WATCHDOG_FAIL_THRESHOLD) {
-        await relaunchCloudflared('公网探测连续失败');
-      }
-    }
-  } catch (e) {
-    watchdogLog(`检查异常：${e.message || e}`);
-  } finally {
-    watchdogBusy = false;
-  }
-}
-
-// [custom] 启动看门狗（幂等；开关关闭时直接返回）
-function startTunnelWatchdog() { // [custom]
-  if (!TUNNEL_WATCHDOG || watchdogStarted) return;
-  watchdogStarted = true;
-  watchdogLog(`已启用，检查间隔 ${WATCHDOG_INTERVAL_MS / 1000}s，公网探测目标 https://${ARGO_DOMAIN || '(无固定域名，仅进程检查)'}/`);
-  setInterval(() => { watchdogTick(); }, WATCHDOG_INTERVAL_MS);
-}
-// ==================== [custom] 隧道看门狗结束 ====================
-
 // 如果订阅器上存在历史运行节点则先删除
 function deleteNodes() {
   try {
@@ -681,14 +551,13 @@ uuid: ${UUID}`;
     }
 
     try {
-      await launchCloudflared(args); // [custom] 原内联 exec 移入 helper，开关关闭时命令逐字节一致
+      await exec(`nohup "${path.resolve(botPath)}" ${args} >/dev/null 2>&1 &`);
       console.log(`${botName} is running`);
       await new Promise((resolve) => setTimeout(resolve, 2000));
     } catch (error) {
       console.error(`Error executing command: ${error}`);
     }
   }
-  startTunnelWatchdog(); // [custom] TUNNEL_WATCHDOG=true 时启动看门狗，否则无操作
   await new Promise((resolve) => setTimeout(resolve, 5000));
 }
 
@@ -804,7 +673,7 @@ async function extractDomains() {
         await new Promise((resolve) => setTimeout(resolve, 3000));
         const args = `tunnel --edge-ip-version auto --no-autoupdate --protocol http2 --logfile "${path.resolve(bootLogPath)}" --loglevel info --url http://localhost:${ARGO_PORT}`;
         try {
-          await launchCloudflared(args); // [custom] 原内联 exec 移入 helper，开关关闭时命令逐字节一致
+          await exec(`nohup "${path.resolve(botPath)}" ${args} >/dev/null 2>&1 &`);
           console.log(`${botName} is running`);
           await new Promise((resolve) => setTimeout(resolve, 6000));
           await extractDomains();
