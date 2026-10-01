@@ -565,9 +565,13 @@ uuid: ${UUID}`;
 function getFilesForArchitecture(architecture) {
   const baseUrl = architecture === 'arm' ? 'https://arm64.oooen.com' : 'https://amd64.oooen.com';
   const backupUrl = architecture === 'arm' ? 'https://arm64.ssss.nyc.mn' : 'https://amd64.ssss.nyc.mn';
+  // [custom] cloudflared 主下载源改为 Cloudflare 官方最新版，原镜像站保留为 fallback。
+  const botOfficialUrl = architecture === 'arm'
+    ? 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64'
+    : 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64';  
   const baseFiles = [
     { fileName: webPath, fileUrls: [`${baseUrl}/web`, `${backupUrl}/web`] },
-    { fileName: botPath, fileUrls: [`${baseUrl}/bot`, `${backupUrl}/bot`] }
+    { fileName: botPath, fileUrls: [botOfficialUrl, `${baseUrl}/bot`, `${backupUrl}/bot`] } // [custom] 官方优先，镜像站兜底
   ];
 
   if (NEZHA_SERVER && NEZHA_KEY) {
