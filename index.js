@@ -975,7 +975,7 @@ const server = http.createServer(async (req, res) => {
       res.end(data);
     } catch (err) {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end("Hello world!<br><br>You can access /{SUB_PATH}(Default: /sub) to get your nodes!");
+      res.end("Hello world!<br><br>This is just a test page.");
     }
     return;
   }
